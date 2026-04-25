@@ -244,7 +244,7 @@ export default function App() {
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
-        const wb = XLSX.read(new Uint8Array(e.target.result), { type:"array", cellDates:true, raw:true });
+        const wb = XLSX.read(new Uint8Array(e.target.result), { type:"array", cellDates:true, raw:false });
         const newWb = convertWorkbook(wb, model);
         const outName = `${file.name.replace(/\.[^.]+$/,"")}_${model}.xlsx`;
         XLSX.writeFile(newWb, outName);
