@@ -54,6 +54,18 @@ const VIP_MAP = {
   "Servicio":          ["servicio", "ciudad"],
 };
 
+// Columnas que deben guardarse como texto para evitar notación científica
+const TEXT_COLUMNS = [
+  "orden", "identificacion", "documento", "cedula", "ticket",
+  "ordenlaboratorio", "ordenfinal", "atencion", "estado"
+];
+
+function isTextColumn(colName) {
+  return TEXT_COLUMNS.some(t => normalize(colName).includes(t));
+}
+
+// ─── UTILIDADES ───────────────────────────────────────────────────────────────
+
 function normalize(str) {
   return String(str ?? "")
     .toLowerCase().replace(/\s+/g, "")
@@ -132,92 +144,179 @@ function dateToSheetName(date) {
   return `${String(date.getDate()).padStart(2,"0")} ${months[date.getMonth()]}`;
 }
 
+// Convierte valor a texto limpio para columnas numéricas grandes
+function toCleanText(val) {
+  if (val === null || val === undefined || val === "") return "";
+  // Si es número, convertir a string sin notación científica
+  if (typeof val === "number") {
+    return val.toFixed(0);
+  }
+  return String(val).trim();
+}
+
+// ─── Detectar fila incompleta ─────────────────────────────────────────────────
+function isRowIncomplete(newRow, targetHeaders) {
+  // Para VIP: ticket=col 2 (ATENCION), orden=col 3, fecha=col 4, hora=col 6
+  // Para IDIME: ticket=col 1 (TICKET), orden=col 4, fecha=col 7, hora=col 6
+  // Buscar por nombre normalizado
+  const ticketIdx = targetHeaders.findIndex(h => {
+    const n = normalize(h);
+    return n === "atencion" || n === "ticket";
+  });
+  const ordenIdx = targetHeaders.findIndex(h => {
+    const n = normalize(h);
+    return n === "ordenlaboratorio" || n === "ordenfinal";
+  });
+  const fechaIdx = targetHeaders.findIndex(h => {
+    const n = normalize(h);
+    return (n.includes("fecha") && n.includes("envio")) || n === "fechaenvioresultados";
+  });
+  const horaIdx = targetHeaders.findIndex(h => normalize(h) === "hora");
+
+  const ticket = ticketIdx !== -1 ? String(newRow[ticketIdx] ?? "").trim() : "";
+  const orden  = ordenIdx  !== -1 ? String(newRow[ordenIdx]  ?? "").trim() : "";
+  const fecha  = fechaIdx  !== -1 ? String(newRow[fechaIdx]  ?? "").trim() : "";
+  const hora   = horaIdx   !== -1 ? String(newRow[horaIdx]   ?? "").trim() : "";
+
+  return !ticket || !orden || !fecha || !hora;
+}
+
+// ─── MAPEO DE FILAS ───────────────────────────────────────────────────────────
 function mapRows(sheetData, targetHeaders, modelMap) {
   const headerIdx = findHeaderRow(sheetData);
   const sourceHeaders = sheetData[headerIdx].map((h) => String(h ?? ""));
   const mapping = buildMapping(sourceHeaders, modelMap);
 
-  // Find best date column for grouping
   const dateColIdx = findSourceCol(sourceHeaders,
     ["fechadeenvio","fechaenvio","fechadeagendamiento","fechaingreso","fechayhora"]);
 
-  const dataRows = [];
+  const completeRows   = [];
+  const incompleteRows = [];
+
   for (let r = headerIdx + 1; r < sheetData.length; r++) {
     const srcRow = sheetData[r];
     if (!srcRow || srcRow.every((v) => v === "" || v === null || v === undefined)) continue;
+
     const newRow = targetHeaders.map((col) => {
       const srcIdx = mapping[col];
       if (srcIdx === -1 || srcIdx === undefined) return "";
       const val = srcRow[srcIdx] ?? "";
       const n = normalize(col);
+
       if (n === "hora") return toTimeString(val);
       if (n.includes("fecha")) return toDateString(val);
+      // Columnas de ID/ticket/orden → texto para evitar notación científica
+      if (isTextColumn(col)) return toCleanText(val);
       return val;
     });
+
     newRow._dateVal = dateColIdx !== -1 ? srcRow[dateColIdx] : null;
-    dataRows.push(newRow);
+
+    if (isRowIncomplete(newRow, targetHeaders)) {
+      incompleteRows.push(newRow);
+    } else {
+      completeRows.push(newRow);
+    }
   }
-  return dataRows;
+
+  return { completeRows, incompleteRows };
 }
 
+// ─── Crear worksheet con formato texto en columnas numéricas grandes ──────────
+function makeWorksheet(headers, rows) {
+  const data = [headers, ...rows];
+  const ws = XLSX.utils.aoa_to_sheet(data);
+
+  // Aplicar formato texto (@) a columnas que lo necesitan
+  headers.forEach((col, colIdx) => {
+    if (isTextColumn(col)) {
+      const colLetter = XLSX.utils.encode_col(colIdx);
+      // Aplicar a todas las filas de datos
+      for (let r = 1; r < data.length; r++) {
+        const cellRef = `${colLetter}${r + 1}`;
+        if (ws[cellRef]) {
+          ws[cellRef].t = "s"; // tipo string
+          ws[cellRef].v = String(ws[cellRef].v ?? "").replace(/\.0+$/, "");
+          ws[cellRef].w = ws[cellRef].v;
+          delete ws[cellRef].z;
+        }
+      }
+    }
+  });
+
+  return ws;
+}
+
+// ─── CONVERSIÓN PRINCIPAL ─────────────────────────────────────────────────────
 function convertWorkbook(wb, targetModel) {
   const targetHeaders = targetModel === "IDIME" ? IDIME_HEADERS : VIP_HEADERS;
   const modelMap      = targetModel === "IDIME" ? IDIME_MAP      : VIP_MAP;
   const newWb = XLSX.utils.book_new();
 
-  let allRows = [];
+  let allComplete   = [];
+  let allIncomplete = [];
+
   for (const sheetName of wb.SheetNames) {
     const ws = wb.Sheets[sheetName];
-    const sheetData = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", raw: true });
-    allRows = allRows.concat(mapRows(sheetData, targetHeaders, modelMap));
+    const sheetData = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", raw: false });
+    const { completeRows, incompleteRows } = mapRows(sheetData, targetHeaders, modelMap);
+    allComplete   = allComplete.concat(completeRows);
+    allIncomplete = allIncomplete.concat(incompleteRows);
   }
 
   const cleanRow = (r) => { const c = [...r]; delete c._dateVal; return c; };
 
   if (targetModel === "IDIME") {
-    // All rows → single sheet
-    const ws = XLSX.utils.aoa_to_sheet([targetHeaders, ...allRows.map(cleanRow)]);
+    const ws = makeWorksheet(targetHeaders, allComplete.map(cleanRow));
     XLSX.utils.book_append_sheet(newWb, ws, "IDIME");
 
   } else {
-    // Split by date → one sheet per day
     const byDay = new Map();
-    const noDate = [];
 
-    for (const row of allRows) {
+    for (const row of allComplete) {
       const dateObj = toDateObj(row._dateVal);
       if (dateObj) {
         const key = `${dateObj.getFullYear()}-${String(dateObj.getMonth()+1).padStart(2,"0")}-${String(dateObj.getDate()).padStart(2,"0")}`;
         if (!byDay.has(key)) byDay.set(key, { date: dateObj, rows: [] });
         byDay.get(key).rows.push(row);
       } else {
-        noDate.push(row);
+        if (!byDay.has("sin-fecha")) byDay.set("sin-fecha", { date: null, rows: [] });
+        byDay.get("sin-fecha").rows.push(row);
       }
     }
 
-    const sortedDays = [...byDay.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    const sortedDays = [...byDay.entries()]
+      .filter(([k]) => k !== "sin-fecha")
+      .sort((a, b) => a[0].localeCompare(b[0]));
 
     for (const [, { date, rows }] of sortedDays) {
       let name = dateToSheetName(date);
       let counter = 2;
       while (newWb.SheetNames.includes(name)) name = `${dateToSheetName(date)}_${counter++}`;
-      const ws = XLSX.utils.aoa_to_sheet([targetHeaders, ...rows.map(cleanRow)]);
+      const ws = makeWorksheet(targetHeaders, rows.map(cleanRow));
       XLSX.utils.book_append_sheet(newWb, ws, name);
     }
 
-    if (noDate.length > 0) {
-      const ws = XLSX.utils.aoa_to_sheet([targetHeaders, ...noDate.map(cleanRow)]);
+    if (byDay.has("sin-fecha")) {
+      const ws = makeWorksheet(targetHeaders, byDay.get("sin-fecha").rows.map(cleanRow));
       XLSX.utils.book_append_sheet(newWb, ws, "Sin fecha");
     }
 
     if (newWb.SheetNames.length === 0) {
-      XLSX.utils.book_append_sheet(newWb, XLSX.utils.aoa_to_sheet([targetHeaders]), "Hoja1");
+      XLSX.utils.book_append_sheet(newWb, makeWorksheet(targetHeaders, []), "Hoja1");
     }
   }
 
-  return newWb;
+  // Hoja REVISAR al final para ambos modelos
+  if (allIncomplete.length > 0) {
+    const ws = makeWorksheet(targetHeaders, allIncomplete.map(cleanRow));
+    XLSX.utils.book_append_sheet(newWb, ws, "⚠ REVISAR");
+  }
+
+  return { newWb, incompleteCount: allIncomplete.length };
 }
 
+// ─── COMPONENTE ───────────────────────────────────────────────────────────────
 export default function App() {
   const [file, setFile]         = useState(null);
   const [model, setModel]       = useState("VIP");
@@ -245,12 +344,20 @@ export default function App() {
     reader.onload = (e) => {
       try {
         const wb = XLSX.read(new Uint8Array(e.target.result), { type:"array", cellDates:true, raw:false });
-        const newWb = convertWorkbook(wb, model);
+        const { newWb, incompleteCount } = convertWorkbook(wb, model);
         const outName = `${file.name.replace(/\.[^.]+$/,"")}_${model}.xlsx`;
         XLSX.writeFile(newWb, outName);
-        const n = newWb.SheetNames.length;
-        const info = model === "VIP" ? `${n} hoja${n!==1?"s":""} (una por día)` : "1 hoja consolidada";
-        setStatus("done"); setMessage(`✅ Descargado como "${outName}" — ${info}`);
+
+        const n = newWb.SheetNames.filter(s => s !== "⚠ REVISAR").length;
+        const info = model === "VIP"
+          ? `${n} hoja${n!==1?"s":""} por día`
+          : "1 hoja consolidada";
+        const revisar = incompleteCount > 0
+          ? ` · ⚠ ${incompleteCount} fila${incompleteCount!==1?"s":""} en hoja REVISAR`
+          : " · ✅ Sin filas incompletas";
+
+        setStatus("done");
+        setMessage(`✅ Descargado como "${outName}" — ${info}${revisar}`);
       } catch (err) {
         setStatus("error"); setMessage("Error: " + err.message);
       }
@@ -321,8 +428,8 @@ export default function App() {
           </div>
           <p className="info-note">
             {model==="VIP"
-              ? "📌 El resultado tendrá una hoja por cada día distinto según la columna de fecha."
-              : "📌 Sin importar cuántas hojas tenga el archivo, todo queda consolidado en una sola hoja."}
+              ? "📌 Filas completas → una hoja por día. Filas con ticket, fecha u hora vacíos → hoja ⚠ REVISAR."
+              : "📌 Filas completas → una sola hoja IDIME. Filas con ticket, fecha u hora vacíos → hoja ⚠ REVISAR."}
           </p>
         </div>
       </main>
